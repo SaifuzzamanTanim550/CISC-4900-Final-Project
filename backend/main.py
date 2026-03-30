@@ -1,167 +1,349 @@
 """
-main.py — FastAPI backend for BC Admissions Email Response Generator.
-
-API Endpoints:
-  POST /api/generate    → Generate a response for a student email
-  GET  /api/templates   → List all available templates
-  GET  /api/health      → Health check
+BC Admissions Email Assistant — Backend
+All logic in one file matching the Colab notebook.
+Run with: uvicorn main:app --host 0.0.0.0 --reload
 """
 
 import os
+import re
+import copy
+import json
 import uuid
+import requests as http_requests
 from pathlib import Path
-from fastapi import FastAPI, HTTPException
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from docx import Document
+from rank_bm25 import BM25Okapi
 
-from retrieval import TemplateRetriever
-from generator import LLMGenerator
-
-# ── Load environment ──
+# ── Load .env ──
 load_dotenv()
-
-HF_TOKEN = os.getenv("HF_TOKEN")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 if not HF_TOKEN:
-    raise ValueError("HF_TOKEN is missing. Add it to your .env file.")
+    print("WARNING: HF_TOKEN not set in .env")
 
-# ── Initialize components ──
+MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
+ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
+CONFIDENCE_THRESHOLD = 8.0
+
+# ── Load DOCX template ──
 TEMPLATE_DIR = Path(__file__).parent / "templates"
 DOCX_FILES = list(TEMPLATE_DIR.glob("*.docx"))
-
 if not DOCX_FILES:
-    raise FileNotFoundError(
-        f"No DOCX files found in {TEMPLATE_DIR}. "
-        "Place your template DOCX file in the backend/templates/ folder."
-    )
+    raise FileNotFoundError(f"No .docx in {TEMPLATE_DIR}. Put your template there.")
 
 DOCX_PATH = str(DOCX_FILES[0])
-print(f"Loading template: {DOCX_PATH}")
+ORIGINAL_DOC = Document(DOCX_PATH)
+print(f"Loaded: {DOCX_PATH} ({len(ORIGINAL_DOC.paragraphs)} paragraphs)")
 
-retriever = TemplateRetriever(DOCX_PATH)
-generator = LLMGenerator(HF_TOKEN)
-
-print(f"Loaded {len(retriever.sections)} templates")
-
-# ── Output directory for generated DOCX files ──
+# ── Output dir ──
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# ── FastAPI app ──
-app = FastAPI(
-    title="BC Admissions Email Assistant",
-    description="AI-powered email response generator for Brooklyn College admissions",
-    version="2.0",
-)
 
-# Allow React frontend to connect
+# ═══════════════════════════════════════════════════════════════
+# LLM HELPER — same as notebook
+# ═══════════════════════════════════════════════════════════════
+
+def llm_call(system_prompt, user_prompt, max_tokens=300, temperature=0):
+    r = http_requests.post(
+        ROUTER_URL,
+        headers={
+            "Authorization": f"Bearer {HF_TOKEN}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": MODEL_ID,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        },
+        timeout=60,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(r.text)
+    return r.json()["choices"][0]["message"]["content"].strip()
+
+
+# ═══════════════════════════════════════════════════════════════
+# HEADING PARSER — same as notebook
+# ═══════════════════════════════════════════════════════════════
+
+def is_template_heading(paragraph):
+    text = (paragraph.text or "").strip()
+    if not text or len(text) < 10:
+        return False
+    runs = paragraph.runs
+    if not runs:
+        return False
+    if text != text.upper():
+        return False
+    has_bold = any(r.bold is True for r in runs)
+    all_none = all(r.bold is None for r in runs)
+    has_false = any(r.bold is False for r in runs)
+    return (has_bold or all_none) and not has_false
+
+
+def build_sections(doc):
+    paragraphs = doc.paragraphs
+    heading_indices = [i for i, p in enumerate(paragraphs) if is_template_heading(p)]
+    raw_sections = []
+    for idx, h_idx in enumerate(heading_indices):
+        end_idx = heading_indices[idx + 1] - 1 if idx + 1 < len(heading_indices) else len(paragraphs) - 1
+        raw_sections.append({
+            "title": paragraphs[h_idx].text.strip(),
+            "start": h_idx,
+            "end": end_idx,
+        })
+
+    skip_titles = {"ADMISSIONS FREQUENTLY ASKED INQUIRY QUESTIONS TEMPLATES"}
+    cleaned = []
+    i = 0
+    while i < len(raw_sections):
+        s = raw_sections[i]
+        if s["title"] in skip_titles:
+            i += 1
+            continue
+        if s["title"] == "OFFICE USE ONLY":
+            if i + 1 < len(raw_sections):
+                raw_sections[i + 1]["start"] = s["start"]
+            i += 1
+            continue
+        if i + 1 < len(raw_sections) and raw_sections[i + 1]["title"].startswith("EXEMPTIONS"):
+            s["title"] = s["title"] + " " + raw_sections[i + 1]["title"]
+            s["end"] = raw_sections[i + 1]["end"]
+            i += 2
+        else:
+            i += 1
+        para_indices = list(range(s["start"], s["end"] + 1))
+        text_lines = []
+        for j in para_indices:
+            t = (paragraphs[j].text or "").strip()
+            if t:
+                text_lines.append(t)
+        body_text = "\n".join(text_lines[1:]) if len(text_lines) > 1 else ""
+        cleaned.append({
+            "title": s["title"],
+            "start": s["start"],
+            "end": s["end"],
+            "para_indices": para_indices,
+            "text": body_text,
+        })
+    return cleaned
+
+
+def tokenize(text):
+    return re.findall(r"[a-zA-Z0-9']+", text.lower())
+
+
+# ── Build BM25 index (title boosted 3x) ──
+SECTIONS = build_sections(ORIGINAL_DOC)
+corpus = [
+    tokenize(s["title"] + " " + s["title"] + " " + s["title"] + " " + s["text"])
+    for s in SECTIONS
+]
+BM25 = BM25Okapi(corpus)
+print(f"Templates: {len(SECTIONS)}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# EXTRACT STUDENT INFO — same as notebook
+# ═══════════════════════════════════════════════════════════════
+
+def extract_student_info(email_text):
+    system = """extract info from student email.
+only return json.
+fields:
+name
+semester
+topic
+
+do not guess name.
+if no name, return empty string."""
+
+    response = llm_call(system, email_text, max_tokens=150)
+    try:
+        match = re.search(r'\{[^}]+\}', response)
+        info = json.loads(match.group()) if match else {}
+    except Exception:
+        info = {}
+
+    name = info.get("name", "")
+    fake_names = ["john doe", "jane doe", "applicant", "student", "n/a", "none", "unknown"]
+    if name.lower().strip() in fake_names:
+        name = ""
+
+    return {
+        "name": name,
+        "semester": info.get("semester", ""),
+        "topic": info.get("topic", "general inquiry"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════
+# TEMPLATE SELECTION — same as notebook
+# ═══════════════════════════════════════════════════════════════
+
+def retrieve_top_k(email, k=5):
+    scores = BM25.get_scores(tokenize(email))
+    ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:k]
+    return [{**SECTIONS[i], "score": float(scores[i])} for i in ranked]
+
+
+def llm_choose(email, candidates):
+    num = len(candidates)
+    previews = []
+    for i, c in enumerate(candidates, 1):
+        body_preview = "\n".join(c["text"].splitlines()[:8])
+        previews.append(f"{i}. {c['title']} | score {c['score']:.1f}\n{body_preview}")
+
+    system = f"""pick best template.
+use title + score.
+if none match return 0.
+only return number from 0 to {num}."""
+
+    prompt = email + "\n\n" + "\n\n".join(previews)
+    response = llm_call(system, prompt, max_tokens=5)
+
+    if "0" in response:
+        return -1
+    for char in response:
+        if char.isdigit():
+            return int(char) - 1
+    return 0
+
+
+def choose_template(email):
+    candidates = retrieve_top_k(email, k=5)
+    if candidates[0]["score"] < CONFIDENCE_THRESHOLD:
+        return None
+    chosen_idx = llm_choose(email, candidates)
+    if chosen_idx == -1:
+        return None
+    return candidates[chosen_idx]
+
+
+# ═══════════════════════════════════════════════════════════════
+# FILL PLACEHOLDERS — same as notebook
+# ═══════════════════════════════════════════════════════════════
+
+def fill_placeholders(doc, section, student_info):
+    name = student_info.get("name", "")
+    semester = student_info.get("semester", "")
+
+    for idx in section["para_indices"]:
+        para = doc.paragraphs[idx]
+        for run in para.runs:
+            if not run.text:
+                continue
+            if semester:
+                run.text = run.text.replace("[specific semester]", semester)
+            else:
+                run.text = run.text.replace("[specific semester]", "the upcoming semester")
+            if name:
+                run.text = run.text.replace("Dear Applicant", f"Dear {name}")
+                run.text = run.text.replace("Dear Student", f"Dear {name}")
+
+
+def export_doc(doc, section, out="response.docx"):
+    new_doc = Document()
+    for p in new_doc.paragraphs:
+        p._element.getparent().remove(p._element)
+    body = new_doc._element.body
+    for idx in section["para_indices"]:
+        if idx == section["start"]:
+            continue
+        body.append(copy.deepcopy(doc.paragraphs[idx]._p))
+    new_doc.save(out)
+    return out
+
+
+def get_plain_text(doc, section):
+    lines = []
+    for idx in section["para_indices"]:
+        if idx == section["start"]:
+            continue
+        text = doc.paragraphs[idx].text.strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
+# FASTAPI APP
+# ═══════════════════════════════════════════════════════════════
+
+app = FastAPI(title="BC Admissions Email Assistant")
+
+# CORS — allow everything, no credentials (fixes the Codespaces CORS error)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, set this to your frontend URL
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ── Request/Response Models ──
-
 class EmailRequest(BaseModel):
     email_text: str
 
-class GenerateResponse(BaseModel):
-    success: bool
-    student_name: str
-    student_semester: str
-    student_topic: str
-    template_title: str
-    response_text: str
-    docx_download_url: str
-    confidence: float
-    message: str
-
-class NoMatchResponse(BaseModel):
-    success: bool
-    student_name: str
-    student_topic: str
-    message: str
-
-class TemplateListResponse(BaseModel):
-    templates: list[str]
-    count: int
-
-
-# ── API Routes ──
 
 @app.get("/api/health")
-def health_check():
-    return {
-        "status": "healthy",
-        "templates_loaded": len(retriever.sections),
-        "docx_file": Path(DOCX_PATH).name,
-    }
+def health():
+    return {"status": "healthy", "templates": len(SECTIONS)}
 
 
-@app.get("/api/templates", response_model=TemplateListResponse)
-def list_templates():
-    """List all available email templates."""
-    titles = retriever.get_template_list()
-    return TemplateListResponse(templates=titles, count=len(titles))
+@app.get("/api/templates")
+def templates():
+    return {"templates": [s["title"] for s in SECTIONS], "count": len(SECTIONS)}
 
 
 @app.post("/api/generate")
-def generate_response(request: EmailRequest):
-    """
-    Generate an email response for a student email.
-
-    Pipeline:
-    1. Extract student info (name, semester, topic)
-    2. Retrieve top-5 templates via BM25
-    3. LLM picks the best template
-    4. Fill placeholders (name, semester)
-    5. Export formatted DOCX
-    6. Return response text + download link
-    """
-    email_text = request.email_text.strip()
-
-    if not email_text:
-        raise HTTPException(status_code=400, detail="Email text cannot be empty.")
-
+def generate(req: EmailRequest):
+    email_text = req.email_text.strip()
     if len(email_text) < 3:
-        raise HTTPException(status_code=400, detail="Email text is too short.")
+        raise HTTPException(400, "Email too short")
 
-    # Step 1: Extract student info
-    student_info = generator.extract_student_info(email_text)
+    # step 1: extract info
+    student_info = extract_student_info(email_text)
 
-    # Step 2: Retrieve candidates
-    candidates = retriever.retrieve(email_text, k=5)
+    # step 2+3: retrieve + choose
+    chosen = choose_template(email_text)
 
-    # Step 3: LLM picks template
-    chosen_idx = generator.choose_template(email_text, candidates)
-
-    # No match found
-    if chosen_idx == -1:
+    if chosen is None:
         return {
             "success": False,
             "student_name": student_info["name"] or "(not found)",
             "student_topic": student_info["topic"],
-            "message": "No matching template found. This email may need a manual response.",
+            "message": "No matching template found.",
         }
 
-    chosen = candidates[chosen_idx]
+    # step 4: fill placeholders
+    working_doc = copy.deepcopy(ORIGINAL_DOC)
+    working_section = {
+        "title": chosen["title"],
+        "start": chosen["start"],
+        "end": chosen["end"],
+        "para_indices": chosen["para_indices"],
+    }
+    fill_placeholders(working_doc, working_section, student_info)
 
-    # Step 4: Fill placeholders
-    working_doc = retriever.fill_placeholders(chosen, student_info)
-
-    # Step 5: Export DOCX
+    # step 5: export docx
     file_id = str(uuid.uuid4())[:8]
     docx_filename = f"response_{file_id}.docx"
     docx_path = OUTPUT_DIR / docx_filename
-    retriever.export_docx(working_doc, chosen, str(docx_path))
+    export_doc(working_doc, working_section, str(docx_path))
 
-    # Step 6: Get plain text
-    response_text = retriever.get_plain_text(working_doc, chosen)
+    # step 6: plain text
+    response_text = get_plain_text(working_doc, working_section)
 
     return {
         "success": True,
@@ -172,23 +354,13 @@ def generate_response(request: EmailRequest):
         "response_text": response_text,
         "docx_download_url": f"/api/download/{docx_filename}",
         "confidence": round(chosen["score"], 2),
-        "message": "Response generated successfully.",
+        "message": "OK",
     }
 
 
 @app.get("/api/download/{filename}")
-def download_docx(filename: str):
-    """Download a generated DOCX response file."""
-    file_path = OUTPUT_DIR / filename
-
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found.")
-
-    return FileResponse(
-        path=str(file_path),
-        filename=filename,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
-
-
-# ── Run with: uvicorn main:app --reload ──
+def download(filename: str):
+    path = OUTPUT_DIR / filename
+    if not path.exists():
+        raise HTTPException(404, "File not found")
+    return FileResponse(str(path), filename=filename)

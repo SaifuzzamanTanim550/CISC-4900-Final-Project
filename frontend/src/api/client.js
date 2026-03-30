@@ -1,5 +1,3 @@
-// In Codespaces, the backend runs on a different forwarded URL
-// Change this to your backend's Codespaces URL
 const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 export async function generateResponse(emailText) {
@@ -17,17 +15,7 @@ export async function generateResponse(emailText) {
   return res.json();
 }
 
-export async function getTemplateList() {
-  const res = await fetch(`${API_BASE}/templates`);
-  if (!res.ok) throw new Error('Failed to load templates');
-  return res.json();
-}
-
 export function getDownloadUrl(path) {
-  return `${API_BASE}${path.startsWith('/api') ? path.replace('/api', '') : path}`;
+  const cleanPath = path.replace(/^\/api/, '');
+  return `${API_BASE}${cleanPath}`;
 }
-```
-
-Then create a file called `.env` inside your `frontend/` folder with your backend's Codespaces URL:
-```
-VITE_API_URL=https://fluffy-trout-pjr64vvw9jppf79pg-8000.app.github.dev/api
