@@ -88,7 +88,7 @@ function App() {
               value={emailText}
               onChange={(e) => setEmailText(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder={"Paste the student's email here...\n\nExample: Hi, my name is Sarah Chen and I applied to Brooklyn College for Fall 2026. My CUNYfirst checklist says my application is under review."}
+              placeholder={"Paste the student's email here...\n\nExample: Hi, my name is David Brown and I applied to Brooklyn College for Fall 2026. My CUNYfirst checklist says my application is under review."}
               disabled={loading}
             />
             <div className="btn-row">

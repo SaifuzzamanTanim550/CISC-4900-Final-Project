@@ -345,6 +345,11 @@ def generate(req: EmailRequest):
     # step 6: plain text
     response_text = get_plain_text(working_doc, working_section)
 
+    # clean up old files (keep only the latest 5)
+    old_files = sorted(OUTPUT_DIR.glob("response_*.docx"), key=lambda f: f.stat().st_mtime)
+    for f in old_files[:-5]:
+        f.unlink()
+
     return {
         "success": True,
         "student_name": student_info["name"] or "(not found)",
