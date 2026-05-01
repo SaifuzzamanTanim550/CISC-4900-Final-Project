@@ -33,7 +33,6 @@ function App() {
   const handleCopy = async () => {
     if (!responseRef.current) return
     try {
-      // Copy rich formatted HTML so paste into Gmail/Outlook keeps bold, links, etc.
       const html = responseRef.current.innerHTML
       const plain = responseRef.current.innerText
       const blob = new Blob([html], { type: 'text/html' })
@@ -46,7 +45,6 @@ function App() {
       ])
       showToast('Copied with formatting — paste into your email!')
     } catch {
-      // Fallback: copy plain text
       navigator.clipboard.writeText(result?.response_text || '')
         .then(() => showToast('Copied as plain text'))
         .catch(() => showToast('Failed to copy'))

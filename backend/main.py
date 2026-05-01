@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from docx import Document
+from docx.oxml.ns import qn
 from rank_bm25 import BM25Okapi
 
 # ── Load .env ──
@@ -46,7 +47,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 
 # ═══════════════════════════════════════════════════════════════
-# LLM HELPER — same as notebook
+# LLM HELPER
 # ═══════════════════════════════════════════════════════════════
 
 def llm_call(system_prompt, user_prompt, max_tokens=300, temperature=0):
@@ -73,7 +74,7 @@ def llm_call(system_prompt, user_prompt, max_tokens=300, temperature=0):
 
 
 # ═══════════════════════════════════════════════════════════════
-# HEADING PARSER — same as notebook
+# HEADING PARSER
 # ═══════════════════════════════════════════════════════════════
 
 def is_template_heading(paragraph):
@@ -154,7 +155,7 @@ print(f"Templates: {len(SECTIONS)}")
 
 
 # ═══════════════════════════════════════════════════════════════
-# EXTRACT STUDENT INFO — same as notebook
+# EXTRACT STUDENT INFO
 # ═══════════════════════════════════════════════════════════════
 
 def extract_student_info(email_text):
@@ -188,7 +189,7 @@ if no name, return empty string."""
 
 
 # ═══════════════════════════════════════════════════════════════
-# TEMPLATE SELECTION — same as notebook
+# TEMPLATE SELECTION
 # ═══════════════════════════════════════════════════════════════
 
 def retrieve_top_k(email, k=5):
@@ -231,7 +232,7 @@ def choose_template(email):
 
 
 # ═══════════════════════════════════════════════════════════════
-# FILL PLACEHOLDERS — same as notebook
+# FILL PLACEHOLDERS
 # ═══════════════════════════════════════════════════════════════
 
 def fill_placeholders(doc, section, student_info):
@@ -276,36 +277,146 @@ def get_plain_text(doc, section):
     return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════════════════════════
+# HTML CONVERTER — preserves bold, Strong style, bullets, links
+# ═══════════════════════════════════════════════════════════════
+
+def _is_run_bold(run):
+    """Check if a run is bold — handles explicit bold, inherited bold, and Strong style."""
+    # Check explicit bold
+    if run.bold is True:
+        return True
+    # Check character style (e.g., "Strong" style makes text bold)
+    if run.style and run.style.font and run.style.font.bold is True:
+        return True
+    # Check XML-level bold element
+    rPr = run._element.find(qn('w:rPr'))
+    if rPr is not None:
+        b = rPr.find(qn('w:b'))
+        if b is not None:
+            val = b.get(qn('w:val'))
+            return val is None or val != '0'
+    return False
+
+
+def _is_run_italic(run):
+    """Check if a run is italic."""
+    if run.italic is True:
+        return True
+    if run.style and run.style.font and run.style.font.italic is True:
+        return True
+    return False
+
+
+def _is_run_underline(run):
+    """Check if a run is underlined."""
+    if run.underline is True:
+        return True
+    if run.style and run.style.font and run.style.font.underline is True:
+        return True
+    return False
+
+
 def get_html_text(doc, section):
-    """Convert section paragraphs to HTML preserving bold, italic, underline."""
+    """Convert section paragraphs to HTML preserving bold, italic, underline, bullets, links."""
     html_parts = []
+    in_list = False
+
     for idx in section["para_indices"]:
         if idx == section["start"]:
             continue
         para = doc.paragraphs[idx]
         text = para.text.strip()
+
+        # Check if bullet
+        pPr = para._element.find(qn('w:pPr'))
+        is_bullet = False
+        if pPr is not None:
+            is_bullet = pPr.find(qn('w:numPr')) is not None
+
+        # Empty paragraph
         if not text:
-            html_parts.append("<br>")
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
             continue
 
+        # Build HTML by walking through XML children in order
         run_html = ""
-        for run in para.runs:
-            t = run.text or ""
-            if not t:
-                continue
-            t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            if run.bold:
-                t = f"<strong>{t}</strong>"
-            if run.italic:
-                t = f"<em>{t}</em>"
-            if run.underline:
-                t = f"<u>{t}</u>"
-            run_html += t
+        for child in para._element:
+            tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
 
-        url_pattern = r'(https?://[^\s<>]+)'
+            # Regular run
+            if tag == 'r':
+                t = ""
+                for t_elem in child.findall(qn('w:t')):
+                    t += t_elem.text or ""
+                if not t:
+                    continue
+
+                t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+                # Find the matching python-docx run to check formatting
+                # Match by text content
+                is_bold = False
+                is_italic = False
+                is_underline = False
+
+                for run in para.runs:
+                    if run._element is child:
+                        is_bold = _is_run_bold(run)
+                        is_italic = _is_run_italic(run)
+                        is_underline = _is_run_underline(run)
+                        break
+
+                if is_bold:
+                    t = f"<strong>{t}</strong>"
+                if is_italic:
+                    t = f"<em>{t}</em>"
+                if is_underline:
+                    t = f"<u>{t}</u>"
+                run_html += t
+
+            # Hyperlink
+            elif tag == 'hyperlink':
+                rid = child.get(qn('r:id'))
+                rel = doc.part.rels.get(rid) if rid else None
+                url = ""
+                if rel and hasattr(rel, 'target_ref'):
+                    url = rel.target_ref
+
+                link_text = ""
+                for r in child.findall(qn('w:r')):
+                    for t_elem in r.findall(qn('w:t')):
+                        link_text += t_elem.text or ""
+
+                if not link_text:
+                    link_text = url
+
+                link_text = link_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+                if url and url.startswith("http"):
+                    run_html += f'<a href="{url}" target="_blank" style="color: #882345; text-decoration: underline;">{link_text}</a>'
+                else:
+                    run_html += link_text
+
+        # Make any remaining plain-text URLs clickable
+        url_pattern = r'(?<!href=")(https?://[^\s<>"]+)'
         run_html = re.sub(url_pattern, r'<a href="\1" target="_blank" style="color: #882345;">\1</a>', run_html)
 
-        html_parts.append(f"<p style='margin: 4px 0; line-height: 1.6;'>{run_html}</p>")
+        if is_bullet:
+            if not in_list:
+                html_parts.append('<ul style="margin: 8px 0 8px 20px; padding: 0; list-style-type: disc;">')
+                in_list = True
+            html_parts.append(f'<li style="margin: 4px 0;">{run_html}</li>')
+        else:
+            if in_list:
+                html_parts.append("</ul>")
+                in_list = False
+            html_parts.append(f'<p style="margin: 8px 0; line-height: 1.6;">{run_html}</p>')
+
+    if in_list:
+        html_parts.append("</ul>")
 
     return "".join(html_parts)
 
@@ -316,7 +427,6 @@ def get_html_text(doc, section):
 
 app = FastAPI(title="BC Admissions Email Assistant")
 
-# CORS — allow everything, no credentials (fixes the Codespaces CORS error)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -346,10 +456,7 @@ def generate(req: EmailRequest):
     if len(email_text) < 3:
         raise HTTPException(400, "Email too short")
 
-    # step 1: extract info
     student_info = extract_student_info(email_text)
-
-    # step 2+3: retrieve + choose
     chosen = choose_template(email_text)
 
     if chosen is None:
@@ -360,7 +467,6 @@ def generate(req: EmailRequest):
             "message": "No matching template found.",
         }
 
-    # step 4: fill placeholders
     working_doc = copy.deepcopy(ORIGINAL_DOC)
     working_section = {
         "title": chosen["title"],
@@ -370,17 +476,14 @@ def generate(req: EmailRequest):
     }
     fill_placeholders(working_doc, working_section, student_info)
 
-    # step 5: export docx
     file_id = str(uuid.uuid4())[:8]
     docx_filename = f"response_{file_id}.docx"
     docx_path = OUTPUT_DIR / docx_filename
     export_doc(working_doc, working_section, str(docx_path))
 
-    # step 6: plain text + html
     response_text = get_plain_text(working_doc, working_section)
     response_html = get_html_text(working_doc, working_section)
 
-    # clean up old files (keep only the latest 5)
     old_files = sorted(OUTPUT_DIR.glob("response_*.docx"), key=lambda f: f.stat().st_mtime)
     for f in old_files[:-5]:
         f.unlink()
