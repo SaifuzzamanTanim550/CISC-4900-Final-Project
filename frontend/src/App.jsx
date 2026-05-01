@@ -8,6 +8,7 @@ function App() {
   const [error, setError] = useState(null)
   const [toast, setToast] = useState('')
   const textareaRef = useRef(null)
+  const responseRef = useRef(null)
 
   const showToast = (msg) => {
     setToast(msg)
@@ -29,11 +30,27 @@ function App() {
     }
   }
 
-  const handleCopy = () => {
-    if (!result?.response_text) return
-    navigator.clipboard.writeText(result.response_text)
-      .then(() => showToast('Copied to clipboard'))
-      .catch(() => showToast('Failed to copy'))
+  const handleCopy = async () => {
+    if (!responseRef.current) return
+    try {
+      // Copy rich formatted HTML so paste into Gmail/Outlook keeps bold, links, etc.
+      const html = responseRef.current.innerHTML
+      const plain = responseRef.current.innerText
+      const blob = new Blob([html], { type: 'text/html' })
+      const blobPlain = new Blob([plain], { type: 'text/plain' })
+      await navigator.clipboard.write([
+        new ClipboardItem({
+          'text/html': blob,
+          'text/plain': blobPlain,
+        })
+      ])
+      showToast('Copied with formatting — paste into your email!')
+    } catch {
+      // Fallback: copy plain text
+      navigator.clipboard.writeText(result?.response_text || '')
+        .then(() => showToast('Copied as plain text'))
+        .catch(() => showToast('Failed to copy'))
+    }
   }
 
   const handleDownload = () => {
@@ -149,9 +166,13 @@ function App() {
                     <span className="meta-tag semester">📅 {result.student_semester}</span>
                   )}
                 </div>
-                <div className="response-text">{result.response_text}</div>
+                <div
+                  ref={responseRef}
+                  className="response-text"
+                  dangerouslySetInnerHTML={{ __html: result.response_html }}
+                />
                 <div className="response-actions">
-                  <button className="btn btn-primary" onClick={handleCopy}>📋 Copy to Clipboard</button>
+                  <button className="btn btn-primary" onClick={handleCopy}>📋 Copy with Formatting</button>
                   <button className="btn btn-gold" onClick={handleDownload}>⬇ Download DOCX</button>
                 </div>
               </>

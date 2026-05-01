@@ -276,6 +276,40 @@ def get_plain_text(doc, section):
     return "\n".join(lines)
 
 
+def get_html_text(doc, section):
+    """Convert section paragraphs to HTML preserving bold, italic, underline."""
+    html_parts = []
+    for idx in section["para_indices"]:
+        if idx == section["start"]:
+            continue
+        para = doc.paragraphs[idx]
+        text = para.text.strip()
+        if not text:
+            html_parts.append("<br>")
+            continue
+
+        run_html = ""
+        for run in para.runs:
+            t = run.text or ""
+            if not t:
+                continue
+            t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            if run.bold:
+                t = f"<strong>{t}</strong>"
+            if run.italic:
+                t = f"<em>{t}</em>"
+            if run.underline:
+                t = f"<u>{t}</u>"
+            run_html += t
+
+        url_pattern = r'(https?://[^\s<>]+)'
+        run_html = re.sub(url_pattern, r'<a href="\1" target="_blank" style="color: #882345;">\1</a>', run_html)
+
+        html_parts.append(f"<p style='margin: 4px 0; line-height: 1.6;'>{run_html}</p>")
+
+    return "".join(html_parts)
+
+
 # ═══════════════════════════════════════════════════════════════
 # FASTAPI APP
 # ═══════════════════════════════════════════════════════════════
@@ -342,8 +376,9 @@ def generate(req: EmailRequest):
     docx_path = OUTPUT_DIR / docx_filename
     export_doc(working_doc, working_section, str(docx_path))
 
-    # step 6: plain text
+    # step 6: plain text + html
     response_text = get_plain_text(working_doc, working_section)
+    response_html = get_html_text(working_doc, working_section)
 
     # clean up old files (keep only the latest 5)
     old_files = sorted(OUTPUT_DIR.glob("response_*.docx"), key=lambda f: f.stat().st_mtime)
@@ -357,6 +392,7 @@ def generate(req: EmailRequest):
         "student_topic": student_info["topic"],
         "template_title": chosen["title"],
         "response_text": response_text,
+        "response_html": response_html,
         "docx_download_url": f"/api/download/{docx_filename}",
         "confidence": round(chosen["score"], 2),
         "message": "OK",
