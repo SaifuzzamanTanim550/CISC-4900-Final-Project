@@ -1,6 +1,25 @@
 import { useState, useRef } from 'react'
 import { generateResponse, getDownloadUrl } from './api/client.js'
 
+// Patterns to detect sensitive information
+const SENSITIVE_PATTERNS = [
+  { name: 'SSN', pattern: /\b\d{3}[-\s]?\d{2}[-\s]?\d{4}\b/ },
+  { name: 'Credit Card', pattern: /\b\d{4}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{4}\b/ },
+  { name: 'Date of Birth', pattern: /\b(DOB|date of birth|born on|birthday)[:\s]*\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}\b/i },
+  { name: 'Phone Number', pattern: /\b(\+?1[-\s]?)?\(?\d{3}\)?[-\s]?\d{3}[-\s]?\d{4}\b/ },
+  { name: 'Home Address', pattern: /\b\d{1,5}\s+([\w\s]+)(street|st|avenue|ave|road|rd|boulevard|blvd|drive|dr|lane|ln|way|court|ct|place|pl)\b/i },
+]
+
+function detectSensitiveInfo(text) {
+  const found = []
+  for (const { name, pattern } of SENSITIVE_PATTERNS) {
+    if (pattern.test(text)) {
+      found.push(name)
+    }
+  }
+  return found
+}
+
 function App() {
   const [emailText, setEmailText] = useState('')
   const [result, setResult] = useState(null)
@@ -10,13 +29,16 @@ function App() {
   const textareaRef = useRef(null)
   const responseRef = useRef(null)
 
+  const sensitiveFound = detectSensitiveInfo(emailText)
+  const hasSensitive = sensitiveFound.length > 0
+
   const showToast = (msg) => {
     setToast(msg)
     setTimeout(() => setToast(''), 2500)
   }
 
   const handleGenerate = async () => {
-    if (!emailText.trim()) return
+    if (!emailText.trim() || hasSensitive) return
     setLoading(true)
     setError(null)
     setResult(null)
@@ -105,9 +127,34 @@ function App() {
               onKeyDown={handleKeyDown}
               placeholder={"Paste the student's email here...\n\nExample: Hi, my name is David Brown and I applied to Brooklyn College for Fall 2026. My CUNYfirst checklist says my application is under review."}
               disabled={loading}
+              style={hasSensitive ? { borderColor: '#c62828', boxShadow: '0 0 0 3px rgba(198, 40, 40, 0.15)' } : {}}
             />
+
+            {hasSensitive && (
+              <div style={{
+                background: '#fde8e8',
+                border: '1px solid #f5c6c6',
+                borderRadius: '8px',
+                padding: '12px 16px',
+                marginTop: '12px',
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: '10px',
+              }}>
+                <span style={{ fontSize: '1.2rem' }}>🔒</span>
+                <div>
+                  <p style={{ fontSize: '0.88rem', color: '#c62828', fontWeight: 600, margin: 0 }}>
+                    Sensitive information detected: {sensitiveFound.join(', ')}
+                  </p>
+                  <p style={{ fontSize: '0.82rem', color: '#5a534d', margin: '4px 0 0 0' }}>
+                    Please remove all personal information (SSN, phone numbers, addresses, dates of birth, credit card numbers) before processing. This information should not be sent to the AI.
+                  </p>
+                </div>
+              </div>
+            )}
+
             <div className="btn-row">
-              <button className="btn btn-primary" onClick={handleGenerate} disabled={loading || !emailText.trim()}>
+              <button className="btn btn-primary" onClick={handleGenerate} disabled={loading || !emailText.trim() || hasSensitive}>
                 {loading ? 'Generating...' : 'Generate Response'}
               </button>
               <button className="btn btn-secondary" onClick={handleClear} disabled={loading}>
