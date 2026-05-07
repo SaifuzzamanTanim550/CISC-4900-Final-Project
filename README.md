@@ -90,3 +90,100 @@ The system does not generate new content. It only retrieves and personalizes app
 ---
 
 ## Project Structure
+
+    CISC-4900-Final-Project/
+    ├── .devcontainer/
+    │   └── devcontainer.json          # Auto-configure Codespaces ports
+    ├── backend/
+    │   ├── main.py                    # All backend logic
+    │   ├── requirements.txt           # Python dependencies
+    │   ├── templates/
+    │   │   └── admissions_templates.docx
+    │   └── outputs/                   # Generated DOCX files
+    ├── frontend/
+    │   ├── src/
+    │   │   ├── App.jsx                # Main React component
+    │   │   ├── index.css              # Brooklyn College branded styles
+    │   │   ├── main.jsx               # React entry point
+    │   │   └── api/
+    │   │       └── client.js          # API client
+    │   ├── index.html
+    │   ├── package.json
+    │   └── vite.config.js
+    ├── archive/                       # Original Colab notebooks
+    ├── screenshots/                   # App screenshots
+    ├── Dockerfile                     # Docker config for Render
+    ├── setup.sh                       # One-command dev setup
+    └── README.md
+
+
+---
+
+## API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | /api/health | Server status, template count, MongoDB connection |
+| GET | /api/templates | All 27 templates with text content |
+| POST | /api/generate | Main pipeline — takes email, returns formatted response |
+| POST | /api/feedback | Save Yes/No feedback for a query |
+| GET | /api/dashboard | Analytics data for the dashboard |
+| GET | /api/download/{filename} | Download generated DOCX file |
+
+---
+
+## Running Locally
+
+### Prerequisites
+
+- Python 3.12+
+- Node.js 18+
+- Hugging Face account with API token
+- MongoDB Atlas account (free tier)
+
+### Quick Start (GitHub Codespaces)
+
+1. Open the repo in GitHub Codespaces
+
+2. Run the setup script:
+
+       bash setup.sh
+
+3. Create the backend environment file:
+
+       echo "HF_TOKEN=your_huggingface_token
+       MONGO_URI=your_mongodb_connection_string" > backend/.env
+
+4. Start the backend:
+
+       cd backend && source .venv/bin/activate && uvicorn main:app --host 0.0.0.0 --reload
+
+5. Start the frontend (new terminal):
+
+       cd frontend && npm run dev
+
+6. Set both ports (3000 and 8000) to Public in the Ports tab
+
+---
+
+## Testing
+
+Tested with 10 standard email scenarios and 5 edge cases. All 15 passed correctly.
+
+Standard tests: application status, accept offer, decline offer, campus tour, transfer requirements, fee waiver, financial aid, film studies program, TOEFL scores, commitment deposit.
+
+Edge cases: no name in email, first-name-only signature, vague one-word email, email with typos, irrelevant question.
+
+---
+
+## Deployment
+
+The frontend is deployed on Vercel (free tier, always available). The backend is deployed on Render (free tier, sleeps after 15 minutes of inactivity). The database is on MongoDB Atlas (free tier, 512MB). All three auto-deploy when code is pushed to the main branch.
+
+---
+
+## Author
+
+Saifuzzaman Tanim
+CISC 4900 Senior Project
+Brooklyn College, Spring 2026
