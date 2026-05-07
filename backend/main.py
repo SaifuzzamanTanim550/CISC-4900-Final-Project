@@ -9,6 +9,7 @@ import re
 import copy
 import json
 import uuid
+from datetime import datetime, timezone
 import requests as http_requests
 from pathlib import Path
 
@@ -27,9 +28,26 @@ HF_TOKEN = os.getenv("HF_TOKEN", "")
 if not HF_TOKEN:
     print("WARNING: HF_TOKEN not set in .env")
 
+MONGO_URI = os.getenv("MONGO_URI", "")
+
 MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
 ROUTER_URL = "https://router.huggingface.co/v1/chat/completions"
 CONFIDENCE_THRESHOLD = 8.0
+
+# ── MongoDB setup ──
+db = None
+try:
+    if MONGO_URI:
+        from pymongo import MongoClient
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        db = mongo_client["bc_admissions"]
+        mongo_client.admin.command('ping')
+        print("MongoDB connected.")
+    else:
+        print("WARNING: MONGO_URI not set — logging disabled.")
+except Exception as e:
+    print(f"WARNING: MongoDB connection failed — logging disabled. Error: {e}")
+    db = None
 
 # ── Load DOCX template ──
 TEMPLATE_DIR = Path(__file__).parent / "templates"
@@ -44,6 +62,29 @@ print(f"Loaded: {DOCX_PATH} ({len(ORIGINAL_DOC.paragraphs)} paragraphs)")
 # ── Output dir ──
 OUTPUT_DIR = Path(__file__).parent / "outputs"
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# MONGODB LOGGING — saves anonymized query data
+# ═══════════════════════════════════════════════════════════════
+
+def log_query(data):
+    """Log a query to MongoDB. Fails silently if DB is not connected."""
+    if db is None:
+        return None
+    try:
+        result = db.queries.insert_one({
+            "timestamp": datetime.now(timezone.utc),
+            "topic": data.get("topic", ""),
+            "template_title": data.get("template_title", ""),
+            "confidence": data.get("confidence", 0),
+            "matched": data.get("matched", False),
+            "feedback": None,
+        })
+        return str(result.inserted_id)
+    except Exception as e:
+        print(f"MongoDB log error: {e}")
+        return None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -278,18 +319,14 @@ def get_plain_text(doc, section):
 
 
 # ═══════════════════════════════════════════════════════════════
-# HTML CONVERTER — preserves bold, Strong style, bullets, links
+# HTML CONVERTER
 # ═══════════════════════════════════════════════════════════════
 
 def _is_run_bold(run):
-    """Check if a run is bold — handles explicit bold, inherited bold, and Strong style."""
-    # Check explicit bold
     if run.bold is True:
         return True
-    # Check character style (e.g., "Strong" style makes text bold)
     if run.style and run.style.font and run.style.font.bold is True:
         return True
-    # Check XML-level bold element
     rPr = run._element.find(qn('w:rPr'))
     if rPr is not None:
         b = rPr.find(qn('w:b'))
@@ -300,7 +337,6 @@ def _is_run_bold(run):
 
 
 def _is_run_italic(run):
-    """Check if a run is italic."""
     if run.italic is True:
         return True
     if run.style and run.style.font and run.style.font.italic is True:
@@ -309,7 +345,6 @@ def _is_run_italic(run):
 
 
 def _is_run_underline(run):
-    """Check if a run is underlined."""
     if run.underline is True:
         return True
     if run.style and run.style.font and run.style.font.underline is True:
@@ -318,7 +353,6 @@ def _is_run_underline(run):
 
 
 def get_html_text(doc, section):
-    """Convert section paragraphs to HTML preserving bold, italic, underline, bullets, links."""
     html_parts = []
     in_list = False
 
@@ -328,40 +362,32 @@ def get_html_text(doc, section):
         para = doc.paragraphs[idx]
         text = para.text.strip()
 
-        # Check if bullet
         pPr = para._element.find(qn('w:pPr'))
         is_bullet = False
         if pPr is not None:
             is_bullet = pPr.find(qn('w:numPr')) is not None
 
-        # Empty paragraph
         if not text:
             if in_list:
                 html_parts.append("</ul>")
                 in_list = False
             continue
 
-        # Build HTML by walking through XML children in order
         run_html = ""
         for child in para._element:
             tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
 
-            # Regular run
             if tag == 'r':
                 t = ""
                 for t_elem in child.findall(qn('w:t')):
                     t += t_elem.text or ""
                 if not t:
                     continue
-
                 t = t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-                # Find the matching python-docx run to check formatting
-                # Match by text content
                 is_bold = False
                 is_italic = False
                 is_underline = False
-
                 for run in para.runs:
                     if run._element is child:
                         is_bold = _is_run_bold(run)
@@ -377,30 +403,24 @@ def get_html_text(doc, section):
                     t = f"<u>{t}</u>"
                 run_html += t
 
-            # Hyperlink
             elif tag == 'hyperlink':
                 rid = child.get(qn('r:id'))
                 rel = doc.part.rels.get(rid) if rid else None
                 url = ""
                 if rel and hasattr(rel, 'target_ref'):
                     url = rel.target_ref
-
                 link_text = ""
                 for r in child.findall(qn('w:r')):
                     for t_elem in r.findall(qn('w:t')):
                         link_text += t_elem.text or ""
-
                 if not link_text:
                     link_text = url
-
                 link_text = link_text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
                 if url and url.startswith("http"):
                     run_html += f'<a href="{url}" target="_blank" style="color: #882345; text-decoration: underline;">{link_text}</a>'
                 else:
                     run_html += link_text
 
-        # Make any remaining plain-text URLs clickable
         url_pattern = r'(?<!href=")(https?://[^\s<>"]+)'
         run_html = re.sub(url_pattern, r'<a href="\1" target="_blank" style="color: #882345;">\1</a>', run_html)
 
@@ -440,14 +460,22 @@ class EmailRequest(BaseModel):
     email_text: str
 
 
+class FeedbackRequest(BaseModel):
+    query_id: str
+    feedback: str
+
+
 @app.get("/api/health")
 def health():
-    return {"status": "healthy", "templates": len(SECTIONS)}
+    return {"status": "healthy", "templates": len(SECTIONS), "mongodb": db is not None}
 
 
 @app.get("/api/templates")
 def templates():
-    return {"templates": [s["title"] for s in SECTIONS], "count": len(SECTIONS)}
+    return {
+        "templates": [{"title": s["title"], "text": s["text"]} for s in SECTIONS],
+        "count": len(SECTIONS),
+    }
 
 
 @app.post("/api/generate")
@@ -460,8 +488,15 @@ def generate(req: EmailRequest):
     chosen = choose_template(email_text)
 
     if chosen is None:
+        query_id = log_query({
+            "topic": student_info["topic"],
+            "template_title": "",
+            "confidence": 0,
+            "matched": False,
+        })
         return {
             "success": False,
+            "query_id": query_id,
             "student_name": student_info["name"] or "(not found)",
             "student_topic": student_info["topic"],
             "message": "No matching template found.",
@@ -488,8 +523,16 @@ def generate(req: EmailRequest):
     for f in old_files[:-5]:
         f.unlink()
 
+    query_id = log_query({
+        "topic": student_info["topic"],
+        "template_title": chosen["title"],
+        "confidence": round(chosen["score"], 2),
+        "matched": True,
+    })
+
     return {
         "success": True,
+        "query_id": query_id,
         "student_name": student_info["name"] or "(not found)",
         "student_semester": student_info["semester"] or "(not specified)",
         "student_topic": student_info["topic"],
@@ -500,6 +543,72 @@ def generate(req: EmailRequest):
         "confidence": round(chosen["score"], 2),
         "message": "OK",
     }
+
+
+@app.post("/api/feedback")
+def submit_feedback(req: FeedbackRequest):
+    if db is None:
+        return {"success": False, "message": "Database not connected"}
+    try:
+        from bson import ObjectId
+        db.queries.update_one(
+            {"_id": ObjectId(req.query_id)},
+            {"$set": {"feedback": req.feedback}}
+        )
+        return {"success": True}
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
+
+@app.get("/api/dashboard")
+def dashboard():
+    if db is None:
+        return {"success": False, "message": "Database not connected"}
+    try:
+        total = db.queries.count_documents({})
+        matched = db.queries.count_documents({"matched": True})
+        unmatched = db.queries.count_documents({"matched": False})
+        thumbs_up = db.queries.count_documents({"feedback": "up"})
+        thumbs_down = db.queries.count_documents({"feedback": "down"})
+
+        pipeline = [
+            {"$match": {"matched": True}},
+            {"$group": {"_id": "$template_title", "count": {"$sum": 1}}},
+            {"$sort": {"count": -1}},
+            {"$limit": 10},
+        ]
+        top_templates = list(db.queries.aggregate(pipeline))
+
+        recent = list(
+            db.queries.find(
+                {},
+                {"_id": 0, "topic": 1, "template_title": 1, "confidence": 1, "matched": 1, "feedback": 1, "timestamp": 1}
+            ).sort("timestamp", -1).limit(20)
+        )
+        for r in recent:
+            if "timestamp" in r and r["timestamp"]:
+                r["timestamp"] = r["timestamp"].isoformat() + "Z"
+
+        avg_pipeline = [
+            {"$match": {"matched": True}},
+            {"$group": {"_id": None, "avg": {"$avg": "$confidence"}}},
+        ]
+        avg_result = list(db.queries.aggregate(avg_pipeline))
+        avg_confidence = round(avg_result[0]["avg"], 1) if avg_result else 0
+
+        return {
+            "success": True,
+            "total_queries": total,
+            "matched": matched,
+            "unmatched": unmatched,
+            "thumbs_up": thumbs_up,
+            "thumbs_down": thumbs_down,
+            "avg_confidence": avg_confidence,
+            "top_templates": [{"name": t["_id"], "count": t["count"]} for t in top_templates],
+            "recent_queries": recent,
+        }
+    except Exception as e:
+        return {"success": False, "message": str(e)}
 
 
 @app.get("/api/download/{filename}")
