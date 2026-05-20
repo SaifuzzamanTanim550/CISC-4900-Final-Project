@@ -423,6 +423,15 @@ function App() {
                       <span className="meta-tag semester">{result.student_semester}</span>
                     )}
                   </div>
+                  <div className={`confidence-indicator ${result.confidence >= 85 ? 'high' : result.confidence >= 70 ? 'medium' : 'low'}`}>
+                    <div className="confidence-bar-track">
+                      <div className="confidence-bar-fill" style={{ width: `${result.confidence}%` }} />
+                    </div>
+                    <div className="confidence-details">
+                      <span className="confidence-label">Confidence</span>
+                      <span className="confidence-value">{result.confidence}%</span>
+                    </div>
+                  </div>
                   <div ref={responseRef} className="response-text" dangerouslySetInnerHTML={{ __html: result.response_html }} />
                   <div className="response-actions">
                     <button className="btn btn-primary" onClick={handleCopy}>Copy with Formatting</button>
@@ -436,7 +445,7 @@ function App() {
                       <>
                         <button className="feedback-btn" onClick={() => handleFeedback('up')}>Yes</button>
                         <button className="feedback-btn" onClick={() => handleFeedback('down')}>No</button>
-                      </>
+                      </                      >
                     )}
                   </div>
                 </>
