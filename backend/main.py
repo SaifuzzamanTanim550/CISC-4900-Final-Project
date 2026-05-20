@@ -128,57 +128,30 @@ def is_template_heading(paragraph):
     if text != text.upper():
         return False
     has_bold = any(r.bold is True for r in runs)
-    all_none = all(r.bold is None for r in runs)
-    has_false = any(r.bold is False for r in runs)
-    return (has_bold or all_none) and not has_false
+    return has_bold
 
 
 def build_sections(doc):
     paragraphs = doc.paragraphs
     heading_indices = [i for i, p in enumerate(paragraphs) if is_template_heading(p)]
-    raw_sections = []
+    sections = []
     for idx, h_idx in enumerate(heading_indices):
         end_idx = heading_indices[idx + 1] - 1 if idx + 1 < len(heading_indices) else len(paragraphs) - 1
-        raw_sections.append({
-            "title": paragraphs[h_idx].text.strip(),
-            "start": h_idx,
-            "end": end_idx,
-        })
-
-    skip_titles = {"ADMISSIONS FREQUENTLY ASKED INQUIRY QUESTIONS TEMPLATES"}
-    cleaned = []
-    i = 0
-    while i < len(raw_sections):
-        s = raw_sections[i]
-        if s["title"] in skip_titles:
-            i += 1
-            continue
-        if s["title"] == "OFFICE USE ONLY":
-            if i + 1 < len(raw_sections):
-                raw_sections[i + 1]["start"] = s["start"]
-            i += 1
-            continue
-        if i + 1 < len(raw_sections) and raw_sections[i + 1]["title"].startswith("EXEMPTIONS"):
-            s["title"] = s["title"] + " " + raw_sections[i + 1]["title"]
-            s["end"] = raw_sections[i + 1]["end"]
-            i += 2
-        else:
-            i += 1
-        para_indices = list(range(s["start"], s["end"] + 1))
+        para_indices = list(range(h_idx, end_idx + 1))
         text_lines = []
         for j in para_indices:
             t = (paragraphs[j].text or "").strip()
             if t:
                 text_lines.append(t)
         body_text = "\n".join(text_lines[1:]) if len(text_lines) > 1 else ""
-        cleaned.append({
-            "title": s["title"],
-            "start": s["start"],
-            "end": s["end"],
+        sections.append({
+            "title": paragraphs[h_idx].text.strip(),
+            "start": h_idx,
+            "end": end_idx,
             "para_indices": para_indices,
             "text": body_text,
         })
-    return cleaned
+    return sections
 
 
 def tokenize(text):
@@ -243,33 +216,77 @@ def llm_choose(email, candidates):
     num = len(candidates)
     previews = []
     for i, c in enumerate(candidates, 1):
-        body_preview = "\n".join(c["text"].splitlines()[:8])
-        previews.append(f"{i}. {c['title']} | score {c['score']:.1f}\n{body_preview}")
+        body_preview = "\n".join(c["text"].splitlines()[:10])
+        previews.append(f"--- TEMPLATE {i} ---\n{c['title']}\n{body_preview}")
 
-    system = f"""pick best template.
-use title + score.
-if none match return 0.
-only return number from 0 to {num}."""
+    templates_block = "\n\n".join(previews)
 
-    prompt = email + "\n\n" + "\n\n".join(previews)
-    response = llm_call(system, prompt, max_tokens=5)
+    system = f"""you help match student emails to response templates at Brooklyn College admissions.
 
-    if "0" in response:
-        return -1
-    for char in response:
-        if char.isdigit():
-            return int(char) - 1
-    return 0
+instructions:
+1. read the student email carefully
+2. identify what they need help with
+3. read each template below
+4. if a template directly helps with their need, pick it
+5. if no template helps, pick 0
 
+{templates_block}
+
+respond in this exact format only:
+NEED: <what the student is asking about>
+CHOICE: <number 1-{num} or 0 if no template helps with their need>
+CONFIDENCE: <0 to 100, how well the template answers their need>
+REASON: <why you picked this template or why none fit>
+
+important:
+- a template must actually address the student's need, not just share similar words
+- if the student has a login or technical problem and no template covers that, pick 0
+- if the student asks about a topic and a template covers that topic, pick it
+- confidence above 80 means the template clearly answers their question
+- confidence below 60 means you are not sure, pick 0 instead"""
+
+    response = llm_call(system, email, max_tokens=120, temperature=0)
+
+    choice = -1
+    confidence = 0
+    reason = ""
+
+    for line in response.splitlines():
+        line = line.strip()
+        if line.upper().startswith("CHOICE:"):
+            val = line.split(":", 1)[1].strip()
+            for char in val:
+                if char.isdigit():
+                    c = int(char)
+                    choice = c - 1 if c > 0 else -1
+                    break
+        elif line.upper().startswith("CONFIDENCE:"):
+            val = line.split(":", 1)[1].strip()
+            nums = re.findall(r"\d+", val)
+            if nums:
+                confidence = min(int(nums[0]), 100)
+        elif line.upper().startswith("REASON:"):
+            reason = line.split(":", 1)[1].strip()
+
+    if confidence < 60:
+        return {"choice": -1, "confidence": confidence, "reason": reason}
+
+    return {"choice": choice, "confidence": confidence, "reason": reason}
+
+
+LLM_CONFIDENCE_THRESHOLD = 60
 
 def choose_template(email):
-    candidates = retrieve_top_k(email, k=5)
+    candidates = retrieve_top_k(email, k=10)
     if candidates[0]["score"] < CONFIDENCE_THRESHOLD:
         return None
-    chosen_idx = llm_choose(email, candidates)
-    if chosen_idx == -1:
+    result = llm_choose(email, candidates)
+    if result["choice"] == -1 or result["confidence"] < LLM_CONFIDENCE_THRESHOLD:
         return None
-    return candidates[chosen_idx]
+    chosen = candidates[result["choice"]]
+    chosen["llm_confidence"] = result["confidence"]
+    chosen["llm_reason"] = result["reason"]
+    return chosen
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -366,6 +383,10 @@ def get_html_text(doc, section):
         is_bullet = False
         if pPr is not None:
             is_bullet = pPr.find(qn('w:numPr')) is not None
+            if not is_bullet:
+                pStyle = pPr.find(qn('w:pStyle'))
+                if pStyle is not None:
+                    is_bullet = pStyle.get(qn('w:val')) == 'ListBullet'
 
         if not text:
             if in_list:
@@ -426,9 +447,10 @@ def get_html_text(doc, section):
 
         if is_bullet:
             if not in_list:
-                html_parts.append('<ul style="margin: 8px 0 8px 20px; padding: 0; list-style-type: disc;">')
+                html_parts.append('<ul style="margin: 10px 0 10px 40px; padding: 0; list-style-type: disc;">')
                 in_list = True
-            html_parts.append(f'<li style="margin: 4px 0;">{run_html}</li>')
+            run_html = run_html.replace("\n", "<br/>")
+            html_parts.append(f'<li style="margin: 6px 0; padding-left: 4px; line-height: 1.6;">{run_html}</li>')
         else:
             if in_list:
                 html_parts.append("</ul>")
@@ -439,7 +461,6 @@ def get_html_text(doc, section):
         html_parts.append("</ul>")
 
     return "".join(html_parts)
-
 
 # ═══════════════════════════════════════════════════════════════
 # FASTAPI APP
@@ -526,7 +547,7 @@ def generate(req: EmailRequest):
     query_id = log_query({
         "topic": student_info["topic"],
         "template_title": chosen["title"],
-        "confidence": round(chosen["score"], 2),
+        "confidence": chosen.get("llm_confidence", 0),
         "matched": True,
     })
 
@@ -540,7 +561,7 @@ def generate(req: EmailRequest):
         "response_text": response_text,
         "response_html": response_html,
         "docx_download_url": f"/api/download/{docx_filename}",
-        "confidence": round(chosen["score"], 2),
+        "confidence": chosen.get("llm_confidence", 0),
         "message": "OK",
     }
 
