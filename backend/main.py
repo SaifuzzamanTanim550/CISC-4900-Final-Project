@@ -372,6 +372,7 @@ def _is_run_underline(run):
 def get_html_text(doc, section):
     html_parts = []
     in_list = False
+    last_was_empty = False
 
     for idx in section["para_indices"]:
         if idx == section["start"]:
@@ -392,7 +393,12 @@ def get_html_text(doc, section):
             if in_list:
                 html_parts.append("</ul>")
                 in_list = False
+            if not last_was_empty and html_parts:
+                html_parts.append('<p style="margin: 0; line-height: 0.8;">&nbsp;</p>')
+                last_was_empty = True
             continue
+
+        last_was_empty = False
 
         run_html = ""
         for child in para._element:
@@ -455,7 +461,7 @@ def get_html_text(doc, section):
             if in_list:
                 html_parts.append("</ul>")
                 in_list = False
-            html_parts.append(f'<p style="margin: 8px 0; line-height: 1.6;">{run_html}</p>')
+            html_parts.append(f'<p style="margin: 2px 0; line-height: 1.6;">{run_html}</p>')
 
     if in_list:
         html_parts.append("</ul>")
